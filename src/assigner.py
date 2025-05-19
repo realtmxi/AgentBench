@@ -4,6 +4,7 @@ import os
 import random
 import threading
 import time
+import signal
 from typing import Dict, List, Union
 from typing import Tuple, Callable, Iterator
 import contextlib
@@ -65,6 +66,13 @@ class Assigner:
         self.finished_count = 0
         self.started_count = 0
         self.running_count = 0
+        
+        # Flag to indicate whether we're shutting down
+        self.shutting_down = False
+        
+        # Timer for score updates
+        self.score_update_timer = None
+        self.score_update_interval = 60  # Update score every 60 seconds
 
         # Step 1. Check if output folder exists (resume or create)
 
@@ -172,7 +180,7 @@ class Assigner:
             node_list.append(task)
             task_node_index[task] = len(node_list) - 1
 
-        while True:
+        while not self.shutting_down:
 
             # Step 0. Get real time task free worker
 
@@ -226,6 +234,8 @@ class Assigner:
                 task = node_list[dst]
                 for _ in range(e.flow):
                     with self.assignment_lock:
+                        if len(self.remaining_tasks[agent][task]) == 0:
+                            continue
                         index = self.remaining_tasks[agent][task].pop()
                         self.free_worker.agent[agent] -= 1
                         self.free_worker.task[task] -= 1
@@ -235,6 +245,67 @@ class Assigner:
             # Step 4. sleep for a while
             time.sleep(interval / 2 + random.random() * interval)
 
+    def save_all_results(self):
+        """Calculate and save partial results for all agent-task pairs"""
+        for agent in self.completions:
+            for task in self.completions[agent]:
+                self.save_partial_results(agent, task)
+        
+    def save_partial_results(self, agent, task):
+        """Calculate and save partial results for a specific agent-task pair"""
+        try:
+            if task in self.tasks and agent in self.completions and task in self.completions[agent]:
+                task_client = self.tasks[task]
+                overall = task_client.calculate_overall(self.completions[agent][task])
+                output_dir = self.get_output_dir(agent, task)
+                os.makedirs(output_dir, exist_ok=True)
+                with open(os.path.join(output_dir, "overall.json"), "w") as f:
+                    f.write(json.dumps(overall, indent=4, ensure_ascii=False))
+                return overall
+        except Exception as e:
+            print(ColorMessage.yellow(f"Warning: Failed to save partial results for {agent}/{task}: {str(e)}"))
+        return None
+    
+    def display_current_scores(self):
+        """Calculate and display the current scores for all agent-task pairs"""
+        print("\n" + "="*50)
+        print(ColorMessage.cyan(f"Current Results ({self.finished_count}/{self.started_count} samples completed):"))
+        
+        for agent in self.completions:
+            for task in self.completions[agent]:
+                try:
+                    overall = self.save_partial_results(agent, task)
+                    if overall:
+                        # Different tasks may have different score formats, try to extract main metric
+                        if "custom" in overall and isinstance(overall["custom"], dict):
+                            main_metrics = []
+                            for key, value in overall["custom"].items():
+                                if isinstance(value, (int, float)):
+                                    main_metrics.append(f"{key}: {value:.4f}")
+                            if main_metrics:
+                                print(ColorMessage.green(f"  {agent}/{task}: {', '.join(main_metrics)}"))
+                            else:
+                                print(ColorMessage.green(f"  {agent}/{task}: Results saved to overall.json"))
+                        else:
+                            print(ColorMessage.green(f"  {agent}/{task}: Results saved to overall.json"))
+                except Exception as e:
+                    print(ColorMessage.yellow(f"  {agent}/{task}: Error calculating score - {str(e)}"))
+        
+        print("="*50 + "\n")
+    
+    def update_scores_timer(self):
+        """Timer function to periodically update and display scores"""
+        if self.shutting_down:
+            return
+            
+        self.display_current_scores()
+        
+        # Schedule the next update if we're still running
+        if not self.shutting_down:
+            self.score_update_timer = threading.Timer(self.score_update_interval, self.update_scores_timer)
+            self.score_update_timer.daemon = True
+            self.score_update_timer.start()
+
     def start(self, tqdm_out=None):
         self.started_count = sum(
             [
@@ -243,6 +314,22 @@ class Assigner:
                 for task in self.remaining_tasks[agent]
             ]
         )
+        
+        # Set up signal handlers for graceful shutdown
+        def signal_handler(sig, frame):
+            print(ColorMessage.yellow("\nReceived Ctrl+C. Waiting for current tasks to complete..."))
+            self.shutting_down = True
+            if self.score_update_timer:
+                self.score_update_timer.cancel()
+                
+        original_sigint_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, signal_handler)
+        
+        # Start the score update timer
+        self.score_update_timer = threading.Timer(self.score_update_interval, self.update_scores_timer)
+        self.score_update_timer.daemon = True
+        self.score_update_timer.start()
+        
         generator = self.worker_generator()
         self.overall_tqdm = tqdm(
             total=self.started_count,
@@ -262,55 +349,72 @@ class Assigner:
                 position=idx + 1,
                 file=tqdm_out,
             )
-        while True:
-            try:
-                agent, task, index = next(generator)
-            except StopIteration:
-                break
-            self.start_worker(agent, task, index, self.finish_callback)
+        try:
+            while True:
+                try:
+                    agent, task, index = next(generator)
+                except StopIteration:
+                    break
+                self.start_worker(agent, task, index, self.finish_callback)
+                
+            # If we're shutting down, wait for running tasks to finish
+            if self.shutting_down:
+                print(ColorMessage.yellow("Waiting for running tasks to finish..."))
+                while self.running_count > 0:
+                    time.sleep(1)
+                    
+        finally:
+            # Cancel the timer if it's still active
+            if self.score_update_timer:
+                self.score_update_timer.cancel()
+                
+            # Calculate and save results for all tasks, even if incomplete
+            print(ColorMessage.yellow("Saving partial results..."))
+            self.save_all_results()
+            
+            # Restore original signal handler
+            signal.signal(signal.SIGINT, original_sigint_handler)
 
-        self.overall_tqdm.close()
-        for agent in self.tqdm_ordered_by_agent:
-            self.tqdm_ordered_by_agent[agent].close()
+            self.overall_tqdm.close()
+            for agent in self.tqdm_ordered_by_agent:
+                self.tqdm_ordered_by_agent[agent].close()
 
-        final_message = (
-            "\n\n============================================\n"
-            + ColorMessage.cyan(f"Message: {self.started_count} sample(s) started. ")
-            + "\n"
-            + ColorMessage.green(
-                f"   >> {self.finished_count} sample(s) finished successfully."
-            )
-            + "\n"
-        )
-        if self.started_count != self.finished_count:
-            final_message += (
-                ColorMessage.red(
-                    f"   >> {self.started_count - self.finished_count} sample(s) failed."
+            # Display final results
+            print(ColorMessage.cyan("\nFinal Results:"))
+            self.display_current_scores()
+                
+            final_message = (
+                "\n\n============================================\n"
+                + ColorMessage.cyan(f"Message: {self.started_count} sample(s) started. ")
+                + "\n"
+                + ColorMessage.green(
+                    f"   >> {self.finished_count} sample(s) finished successfully."
                 )
                 + "\n"
             )
-        final_message += (
-            ColorMessage.cyan(
-                f"   >> results are saved to {self.config.output}"
+            if self.started_count != self.finished_count:
+                final_message += (
+                    ColorMessage.red(
+                        f"   >> {self.started_count - self.finished_count} sample(s) failed."
+                    )
+                    + "\n"
+                )
+            final_message += (
+                ColorMessage.cyan(
+                    f"   >> results are saved to {self.config.output}"
+                )
+                + "\n"
             )
-            + "\n"
-        )
-        final_message += "============================================\n\n"
-        print(final_message)
+            final_message += "============================================\n\n"
+            print(final_message)
 
     def record_completion(
         self, agent: str, task: str, index: SampleIndex, result: TaskOutput
     ):
         def calculate_overall_worker():
             nonlocal agent, task, index, result
-            task_client = self.tasks[task]
-            overall = task_client.calculate_overall(self.completions[agent][task])
-            with open(
-                os.path.join(self.get_output_dir(agent, task), "overall.json"), "w"
-            ) as f:
-                f.write(json.dumps(overall, indent=4, ensure_ascii=False))
+            self.save_partial_results(agent, task)
 
-        overall_calculation = False
         with self.assignment_lock:
             if agent not in self.completions:
                 self.completions[agent] = {}
@@ -318,8 +422,10 @@ class Assigner:
                 self.completions[agent][task] = []
             result.index = index
             self.completions[agent][task].append(result)
-            if len(self.completions[agent][task]) == len(self.task_indices[task]):
-                overall_calculation = True
+            
+            # Always save partial results if all samples for this task are completed
+            overall_calculation = len(self.completions[agent][task]) == len(self.task_indices[task])
+            
         if overall_calculation:
             output_dir = self.get_output_dir(agent, task)
             if os.path.exists(os.path.join(output_dir, "overall.json")):
@@ -336,7 +442,8 @@ class Assigner:
                 )
             )
             with self.assignment_lock:
-                self.remaining_tasks[agent][task].insert(0, index)
+                if not self.shutting_down:
+                    self.remaining_tasks[agent][task].insert(0, index)
                 self.free_worker.agent[agent] += 1
                 self.free_worker.task[task] += 1
                 self.running_count -= 1
@@ -345,7 +452,7 @@ class Assigner:
         if result.error is not None:
             print(ColorMessage.yellow(f"Warning: {agent}/{task}#{index} "
                                       f"failed with error {result.error} {result.info} {result.output}"))
-            if self.auto_retry:
+            if self.auto_retry and not self.shutting_down:
                 with self.assignment_lock:
                     self.remaining_tasks[agent][task].insert(0, index)
 
@@ -414,6 +521,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--auto-retry", "-r", action="store_true", dest="retry"
     )
+    parser.add_argument(
+        "--score-interval", "-i", type=int, default=60,
+        help="Interval in seconds to display current scores (default: 60)"
+    )
     args = parser.parse_args()
 
     loader = ConfigLoader()
@@ -422,4 +533,7 @@ if __name__ == "__main__":
     value = AssignmentConfig.post_validate(value)
     v = value.dict()
     with std_out_err_redirect_tqdm() as orig_stdout:
-        Assigner(value, args.retry).start(tqdm_out=orig_stdout)
+        assigner = Assigner(value, args.retry)
+        if args.score_interval:
+            assigner.score_update_interval = args.score_interval
+        assigner.start(tqdm_out=orig_stdout)
