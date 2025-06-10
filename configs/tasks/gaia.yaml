@@ -1,1 +1,16 @@
- 
+name: gaia
+module: src.server.tasks.gaia
+cls: GAIATask
+
+config:
+  dataset_type: validation  # or 'test' when ready
+  level: level1            # level1, level2, or level3  
+  data_dir: data/gaia      # Path to GAIA dataset
+  max_rounds: 20           # Maximum interaction rounds
+  timeout_per_round: 300   # Timeout per round in seconds
+
+# AgentBench integration settings
+parallel: 4                # Number of parallel workers
+sample_size: -1           # -1 for all samples, or specific number for testing
+sample_method: random     # random or first
+indices: []               # Specific indices to test (empty for all)
