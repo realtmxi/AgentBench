@@ -6,6 +6,34 @@ gpt-3.5-turbo-0613:
             model: "gpt-3.5-turbo-0613"
             max_tokens: 512
 
+gpt-o4-mini:
+    import: "./openai-chat.yaml"
+    parameters:
+        name: "gpt-o4-mini"
+        url: <url>/openai/deployments/o4-mini/chat/completions
+        body:
+            model: "o4-mini"
+            max_completion_tokens: 512
+
+gpt-4o:
+    import: "./openai-chat.yaml"
+    parameters:
+        name: "gpt-4o"
+        url: <url>/openai/deployments/gpt-4o/chat/completions
+        body:
+            model: "gpt-4o"
+            max_tokens: 512
+            temperature: 0
+
+gpt-o1:
+    import: "./openai-chat.yaml"
+    parameters:
+        name: "gpt-o1"
+        url: <url>/openai/deployments/o1/chat/completions
+        body:
+            model: "o1"
+            max_completion_tokens: 512
+
 qwq-32b:
     import: "./qwq.yaml"
     parameters:
