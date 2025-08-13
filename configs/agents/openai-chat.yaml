@@ -1,0 +1,12 @@
+module: src.client.agents.HTTPAgent
+parameters:
+  url: 
+  headers:
+    Content-Type: application/json
+    Authorization: 
+  body: {}
+  prompter:
+    name: role_content_dict
+    args:
+      agent_role: assistant
+  return_format: "{response[choices][0][message][content]}"
