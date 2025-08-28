@@ -3,7 +3,7 @@ parameters:
   url: 
   headers:
     Content-Type: application/json
-    Authorization: 
+    Authorization: Bearer <api_key>
   body: {}
   prompter:
     name: role_content_dict
